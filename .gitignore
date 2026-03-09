@@ -1,0 +1,5 @@
+# Auto-generated compose files and sensitive config
+dify/.compose/
+dify/deploy.env.local
+dify/ssl/
+dify/logs/

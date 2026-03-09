@@ -1,0 +1,79 @@
+# =============================================================================
+# squid.conf.template — Dify SSRF 防护代理配置模板
+#
+# 用途：阻止 Dify 工作流/代码节点通过 HTTP Request 工具访问内网服务，
+#       防止 Server-Side Request Forgery（SSRF）攻击。
+#
+# 变量（由 docker-entrypoint.sh 使用 envsubst 替换）：
+#   SQUID_HTTP_PORT  — Squid 监听端口，默认 3128
+#   COREDUMP_DIR     — Squid coredump 目录，默认 /var/spool/squid
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 端口白名单 ACL
+# ---------------------------------------------------------------------------
+acl SSL_ports  port 443
+acl Safe_ports port 80        # HTTP
+acl Safe_ports port 443       # HTTPS
+acl Safe_ports port 8080      # HTTP alternate
+acl Safe_ports port 1025-65535 # 非系统端口（用户自定义服务）
+acl CONNECT    method CONNECT
+
+# ---------------------------------------------------------------------------
+# 阻止访问的目标地址 ACL（私有/保留 IP 段 + 云厂商元数据端点）
+# ---------------------------------------------------------------------------
+
+# 本地回环
+acl blocked_dst dst 127.0.0.0/8
+acl blocked_dst dst ::1
+
+# RFC 1918 — 私有网段（内网服务器）
+acl blocked_dst dst 10.0.0.0/8
+acl blocked_dst dst 172.16.0.0/12
+acl blocked_dst dst 192.168.0.0/16
+
+# RFC 3927 — 链路本地（AWS / Azure / GCP 实例元数据：169.254.169.254）
+acl blocked_dst dst 169.254.0.0/16
+
+# RFC 6598 — 运营商级 NAT（Carrier-grade NAT）
+acl blocked_dst dst 100.64.0.0/10
+
+# RFC 1122 — "this" 网络
+acl blocked_dst dst 0.0.0.0/8
+
+# IPv6 私有段
+acl blocked_dst dst fc00::/7
+acl blocked_dst dst fe80::/10
+
+# ---------------------------------------------------------------------------
+# 访问控制规则（顺序从上至下，第一条匹配即生效）
+# ---------------------------------------------------------------------------
+
+# 拒绝访问非标准端口（防止端口扫描）
+http_access deny !Safe_ports
+
+# 拒绝 CONNECT 到非 HTTPS 端口（防止 HTTPS 隧道绕过）
+http_access deny CONNECT !SSL_ports
+
+# 拒绝访问内网 / 保留 IP 段（核心 SSRF 防护规则）
+http_access deny blocked_dst
+
+# 允许其余所有出站请求（公网地址）
+http_access allow all
+
+# ---------------------------------------------------------------------------
+# 服务配置
+# ---------------------------------------------------------------------------
+http_port ${SQUID_HTTP_PORT}
+
+# 不显示 Squid 版本信息（减少信息泄露）
+httpd_suppress_version_string on
+
+# 隐藏 Via / X-Forwarded-For 头（不向目标服务器泄露内网信息）
+forwarded_for delete
+via off
+
+coredump_dir ${COREDUMP_DIR}
+
+# DNS 解析超时（防止 DNS rebinding 攻击：快速失败）
+dns_timeout 5 seconds
