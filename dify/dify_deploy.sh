@@ -137,7 +137,8 @@ usage() {
 load_env() {
     if [[ ! -f "${ENV_FILE}" ]]; then
         echo "[ERROR] 环境变量文件不存在: ${ENV_FILE}" >&2
-        echo "        请复制 deploy.env.example 为 deploy.env 并填写配置" >&2
+        echo "        请复制 deploy.env 为 deploy.env.local，填写所有 [必填] 项后使用 --env-file deploy.env.local 启动" >&2
+        echo "        示例：bash dify_deploy.sh --env-file deploy.env.local up" >&2
         exit 1
     fi
     # 仅导出非注释、非空行的变量（不覆盖已有 shell 环境变量）
@@ -156,8 +157,13 @@ declare -A ROLE_MAP   # role_name -> 1
 parse_roles() {
     # 将逗号替换为空格，再分割
     local role_str="${ROLES//,/ }"
+    local valid_roles=" infrastructure api worker web nginx all "
     for r in ${role_str}; do
-        ROLE_MAP["${r}"]=1
+        if [[ "${valid_roles}" != *" ${r} "* ]]; then
+            echo "[WARN] 未知角色: '${r}'，已忽略。有效角色: infrastructure api worker web nginx all" >&2
+        else
+            ROLE_MAP["${r}"]=1
+        fi
     done
 
     # "all" 展开为全部角色
@@ -166,6 +172,11 @@ parse_roles() {
         for r in infrastructure api worker web nginx; do
             ROLE_MAP["${r}"]=1
         done
+    fi
+
+    if [[ "${#ROLE_MAP[@]}" -eq 0 ]]; then
+        echo "[ERROR] 未指定任何有效角色，请使用 --role 指定角色" >&2
+        exit 1
     fi
 
     echo "[INFO] 本机部署角色: ${!ROLE_MAP[*]}"
@@ -304,13 +315,14 @@ gen_service_infrastructure() {
 
   # ------------------------------------------------------------------
   # SSRF Proxy：防止服务端请求伪造的出站代理
+  # 配置文件位于 ssrf_proxy/squid.conf.template（相对于 dify/ 目录）
   # ------------------------------------------------------------------
   ssrf_proxy:
     image: ubuntu/squid:latest
     restart: always
     volumes:
-      - ./ssrf_proxy/squid.conf.template:/etc/squid/squid.conf.template
-      - ./ssrf_proxy/docker-entrypoint.sh:/docker-entrypoint-mount.sh
+      - ../ssrf_proxy/squid.conf.template:/etc/squid/squid.conf.template
+      - ../ssrf_proxy/docker-entrypoint.sh:/docker-entrypoint-mount.sh
     entrypoint: >
       sh -c "
         cp /docker-entrypoint-mount.sh /docker-entrypoint.sh &&
@@ -335,6 +347,17 @@ gen_service_api() {
     if [[ "${API_REPLICAS}" -eq 1 ]]; then
         port_mapping="    ports:
       - \"\${API_BIND_HOST:-127.0.0.1}:\${API_PORT:-5001}:5001\""
+    fi
+
+    # depends_on 只列出本机 compose 文件中实际存在的服务，
+    # 避免多机部署时（无 infrastructure 角色）引发 "undefined service" 错误
+    local depends_block=""
+    if has_role infrastructure; then
+        depends_block="    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy"
     fi
 
     cat <<EOF
@@ -397,9 +420,15 @@ ${port_mapping}
       CODE_MAX_NUMBER_ARRAY_LENGTH: \${CODE_MAX_NUMBER_ARRAY_LENGTH:-1000}
 
       # 邮件（可选）
-      MAIL_TYPE: \${MAIL_TYPE:-resend}
+      MAIL_TYPE: \${MAIL_TYPE:-}
       RESEND_API_KEY: \${RESEND_API_KEY:-}
       MAIL_DEFAULT_SEND_FROM: \${MAIL_DEFAULT_SEND_FROM:-}
+      SMTP_SERVER: \${SMTP_SERVER:-}
+      SMTP_PORT: \${SMTP_PORT:-465}
+      SMTP_USERNAME: \${SMTP_USERNAME:-}
+      SMTP_PASSWORD: \${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: \${SMTP_USE_TLS:-true}
+      SMTP_OPPORTUNISTIC_TLS: \${SMTP_OPPORTUNISTIC_TLS:-false}
 
       # 服务基础 URL（nginx 对外地址）
       CONSOLE_WEB_URL: \${CONSOLE_WEB_URL:-}
@@ -407,9 +436,9 @@ ${port_mapping}
       SERVICE_API_URL: \${SERVICE_API_URL:-}
       APP_WEB_URL: \${APP_WEB_URL:-}
 
-      # SSRF 代理
-      SSRF_PROXY_HTTP_URL: http://ssrf_proxy:3128
-      SSRF_PROXY_HTTPS_URL: http://ssrf_proxy:3128
+      # SSRF 代理（出站 HTTP 请求经由 squid，防 Server-Side Request Forgery）
+      SSRF_PROXY_HTTP_URL: \${SSRF_PROXY_HTTP_URL:-http://ssrf_proxy:3128}
+      SSRF_PROXY_HTTPS_URL: \${SSRF_PROXY_HTTPS_URL:-http://ssrf_proxy:3128}
 
       # 文件上传限制
       UPLOAD_FILE_SIZE_LIMIT: \${UPLOAD_FILE_SIZE_LIMIT:-15}
@@ -417,11 +446,7 @@ ${port_mapping}
       UPLOAD_IMAGE_FILE_SIZE_LIMIT: \${UPLOAD_IMAGE_FILE_SIZE_LIMIT:-10}
     volumes:
       - dify_storage:/app/api/storage
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+${depends_block}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
       interval: 30s
@@ -441,6 +466,16 @@ EOF
 
 # --- 4.4 Worker 服务 ---
 gen_service_worker() {
+    # depends_on 只列出本机实际存在的服务（多机部署时 db/redis 在远端）
+    local depends_block=""
+    if has_role infrastructure; then
+        depends_block="    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy"
+    fi
+
     cat <<EOF
   # ------------------------------------------------------------------
   # Celery Worker：异步任务处理（文档索引、模型推理队列等）
@@ -494,8 +529,8 @@ gen_service_worker() {
       CODE_EXECUTION_API_KEY: \${SANDBOX_API_KEY}
 
       # SSRF 代理
-      SSRF_PROXY_HTTP_URL: http://ssrf_proxy:3128
-      SSRF_PROXY_HTTPS_URL: http://ssrf_proxy:3128
+      SSRF_PROXY_HTTP_URL: \${SSRF_PROXY_HTTP_URL:-http://ssrf_proxy:3128}
+      SSRF_PROXY_HTTPS_URL: \${SSRF_PROXY_HTTPS_URL:-http://ssrf_proxy:3128}
 
       # Worker 并发数
       CELERY_WORKER_AMOUNT: \${CELERY_WORKER_AMOUNT:-}
@@ -504,11 +539,7 @@ gen_service_worker() {
       CELERY_MIN_WORKERS: \${CELERY_MIN_WORKERS:-1}
     volumes:
       - dify_storage:/app/api/storage
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+${depends_block}
     networks:
       - dify
 
@@ -557,7 +588,7 @@ gen_service_nginx() {
       - "\${NGINX_HTTP_PORT:-80}:80"
       - "\${NGINX_HTTPS_PORT:-443}:443"
     volumes:
-      - \${NGINX_CONF_DIR:-./.compose/nginx}:/etc/nginx/conf.d:ro
+      - \${NGINX_CONF_DIR:-./nginx}:/etc/nginx/conf.d:ro
       - \${NGINX_SSL_DIR:-./ssl}:/etc/nginx/ssl:ro
       - \${NGINX_LOG_DIR:-./logs/nginx}:/var/log/nginx
 ${depends_block}
@@ -643,7 +674,46 @@ proxy_set_header X-Forwarded-Proto $scheme;
 proxy_http_version 1.1;
 proxy_set_header Connection "";  # 开启 HTTP keepalive upstream
 
-# API 路由
+# SSE / 流式响应专用路由（必须在通用 location 之前声明，nginx 按最长前缀匹配）
+# 匹配 Dify 所有流式 SSE 端点，禁止 nginx 缓冲，避免流式内容被攒够再发送
+location = /v1/chat-messages {
+    proxy_pass        http://dify_api_upstream;
+    proxy_buffering   off;
+    proxy_cache       off;
+    proxy_read_timeout 3600s;
+    proxy_set_header  Connection "";
+    chunked_transfer_encoding on;
+}
+
+location = /v1/completion-messages {
+    proxy_pass        http://dify_api_upstream;
+    proxy_buffering   off;
+    proxy_cache       off;
+    proxy_read_timeout 3600s;
+    proxy_set_header  Connection "";
+    chunked_transfer_encoding on;
+}
+
+location = /v1/workflows/run {
+    proxy_pass        http://dify_api_upstream;
+    proxy_buffering   off;
+    proxy_cache       off;
+    proxy_read_timeout 3600s;
+    proxy_set_header  Connection "";
+    chunked_transfer_encoding on;
+}
+
+# console SSE endpoints
+location ~ ^/console/api/apps/[a-zA-Z0-9_-]+/(chat-messages|completion-messages|workflows/run)$ {
+    proxy_pass        http://dify_api_upstream;
+    proxy_buffering   off;
+    proxy_cache       off;
+    proxy_read_timeout 3600s;
+    proxy_set_header  Connection "";
+    chunked_transfer_encoding on;
+}
+
+# API 路由（通用，含 buffering）
 location /console/api {
     proxy_pass http://dify_api_upstream;
 }
@@ -658,15 +728,6 @@ location /v1 {
 
 location /files {
     proxy_pass http://dify_api_upstream;
-}
-
-# SSE 流式响应（禁止 buffering）
-location ~* /api/.*\.(stream|chat-messages|completion-messages|workflows/run) {
-    proxy_pass        http://dify_api_upstream;
-    proxy_buffering   off;
-    proxy_cache       off;
-    proxy_set_header  Connection "";
-    chunked_transfer_encoding on;
 }
 
 # Web 前端
@@ -718,12 +779,11 @@ compose_cmd() {
 
 cmd_up() {
     echo "[INFO] 启动 Dify 服务..."
-    compose_cmd up -d --remove-orphans
-
-    # API 副本数大于 1 时使用 scale 扩容（docker compose v2 语法）
-    if [[ "${API_REPLICAS}" -gt 1 ]] && has_role api; then
-        echo "[INFO] 扩容 API 服务至 ${API_REPLICAS} 个副本..."
-        compose_cmd scale api="${API_REPLICAS}"
+    if has_role api && [[ "${API_REPLICAS}" -gt 1 ]]; then
+        echo "[INFO] API 服务将以 ${API_REPLICAS} 个副本启动..."
+        compose_cmd up -d --remove-orphans --scale api="${API_REPLICAS}"
+    else
+        compose_cmd up -d --remove-orphans
     fi
 
     echo "[INFO] 服务已启动，运行状态："
@@ -801,6 +861,20 @@ pre_flight_check() {
     done
     if [[ "${missing}" -gt 0 ]]; then
         echo "[ERROR] 存在 ${missing} 个未设置的必要变量，请检查 ${ENV_FILE}" >&2
+        exit 1
+    fi
+
+    # 检测示例占位符值（用户忘记替换 CHANGE_ME_ 前缀）
+    local placeholder_found=0
+    for var in "${required_vars[@]}"; do
+        if [[ "${!var:-}" == CHANGE_ME_* ]]; then
+            echo "[ERROR] 变量 ${var} 仍为示例占位符值，请替换为真实密钥" >&2
+            placeholder_found=$((placeholder_found + 1))
+        fi
+    done
+    if [[ "${placeholder_found}" -gt 0 ]]; then
+        echo "[ERROR] 请编辑 ${ENV_FILE}，将所有 CHANGE_ME_* 替换为实际生成的密钥" >&2
+        echo "        密钥生成示例：openssl rand -hex 32" >&2
         exit 1
     fi
 
